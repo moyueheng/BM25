@@ -11,12 +11,15 @@ import os
 import jieba
 import pickle
 import logging
+import numpy as np
+from typing import List, Tuple
 
 jieba.setLogLevel(log_level=logging.INFO)
 
 
 class BM25Param(object):
-    def __init__(self, f, df, idf, length, avg_length, docs_list, line_length_list,k1=1.5, k2=1.0,b=0.75):
+    def __init__(self, f: List[dict], df: dict, idf: dict, length: int, avg_length: float, 
+                 docs_list: List[str], line_length_list: List[int], k1: float = 1.5, k2: float = 1.0, b: float = 0.75):
         """
 
         :param f:
@@ -51,11 +54,12 @@ class BM25(object):
     _stop_words_path = "data/stop_words.txt"
     _stop_words = []
 
-    def __init__(self, docs=""):
+    def __init__(self, docs: str = ""):
         self.docs = docs
+        self._stop_words = self._load_stop_words()
         self.param: BM25Param = self._load_param()
 
-    def _load_stop_words(self):
+    def _load_stop_words(self) -> List[str]:
         if not os.path.exists(self._stop_words_path):
             raise Exception(f"system stop words: {self._stop_words_path} not found")
         stop_words = []
@@ -65,17 +69,15 @@ class BM25(object):
                 stop_words.append(line)
         return stop_words
 
-    def _build_param(self):
-
-        def _cal_param(reader_obj):
-            f = []  # 列表的每一个元素是一个dict，dict存储着一个文档中每个词的出现次数
-            df = {}  # 存储每个词及出现了该词的文档数量
-            idf = {}  # 存储每个词的idf值
-            lines = reader_obj.readlines()
+    def _build_param(self) -> BM25Param:
+        def _cal_param(lines: List[str]) -> BM25Param:
+            f = []
+            df = {}
             length = len(lines)
             words_count = 0
             docs_list = []
-            line_length_list =[]
+            line_length_list = []
+
             for line in lines:
                 line = line.strip()
                 if not line:
@@ -84,80 +86,56 @@ class BM25(object):
                 line_length_list.append(len(words))
                 docs_list.append(line)
                 words_count += len(words)
+                
                 tmp_dict = {}
                 for word in words:
                     tmp_dict[word] = tmp_dict.get(word, 0) + 1
-                f.append(tmp_dict)
-                for word in tmp_dict.keys():
                     df[word] = df.get(word, 0) + 1
-            for word, num in df.items():
-                idf[word] = math.log(length - num + 0.5) - math.log(num + 0.5)
-            param = BM25Param(f, df, idf, length, words_count / length, docs_list, line_length_list)
-            return param
+                f.append(tmp_dict)
 
-        # cal
-        if self.docs:
-            if not os.path.exists(self.docs):
-                raise Exception(f"input docs {self.docs} not found")
-            with open(self.docs, 'r', encoding='utf8') as reader:
-                param = _cal_param(reader)
+            idf = {word: math.log(length - num + 0.5) - math.log(num + 0.5) for word, num in df.items()}
+            return BM25Param(f, df, idf, length, words_count / length, docs_list, line_length_list)
 
-        else:
-            if not os.path.exists(self._docs_path):
-                raise Exception(f"system docs {self._docs_path} not found")
-            with open(self._docs_path, 'r', encoding='utf8') as reader:
-                param = _cal_param(reader)
+        file_path = self.docs if self.docs else self._docs_path
+        if not os.path.exists(file_path):
+            raise FileNotFoundError(f"Document file not found: {file_path}")
 
+        with open(file_path, 'r', encoding='utf8') as reader:
+            lines = reader.readlines()
+        
+        param = _cal_param(lines)
         with open(self._param_pkl, 'wb') as writer:
             pickle.dump(param, writer)
         return param
 
-    def _load_param(self):
-        self._stop_words = self._load_stop_words()
-        if self.docs:
-            param = self._build_param()
-        else:
-            if not os.path.exists(self._param_pkl):
-                param = self._build_param()
-            else:
-                with open(self._param_pkl, 'rb') as reader:
-                    param = pickle.load(reader)
-        return param
+    def _load_param(self) -> BM25Param:
+        if self.docs or not os.path.exists(self._param_pkl):
+            return self._build_param()
+        
+        with open(self._param_pkl, 'rb') as reader:
+            return pickle.load(reader)
 
-    def _cal_similarity(self, words, index):
+    def _cal_similarity(self, words: List[str], index: int) -> float:
         score = 0
         for word in words:
             if word not in self.param.f[index]:
                 continue
-            molecular = self.param.idf[word] * self.param.f[index][word] * (self.param.k1 + 1)
-            denominator = self.param.f[index][word] + self.param.k1 * (1 - self.param.b +
-                                                                       self.param.b * self.param.line_length_list[index] /
-                                                                       self.param.avg_length)
-            score += molecular / denominator
+            idf = self.param.idf[word]
+            f = self.param.f[index][word]
+            k1, b = self.param.k1, self.param.b
+            doc_len = self.param.line_length_list[index]
+            avg_len = self.param.avg_length
+
+            score += idf * ((f * (k1 + 1)) / (f + k1 * (1 - b + b * doc_len / avg_len)))
         return score
 
-    def cal_similarity(self, query: str):
-        """
-        相似度计算，无排序结果
-        :param query: 待查询结果
-        :return: [(doc, score), ..]
-        """
+    def cal_similarity(self, query: str) -> List[Tuple[str, float]]:
         words = [word for word in jieba.lcut(query) if word and word not in self._stop_words]
-        score_list = []
-        for index in range(self.param.length):
-            score = self._cal_similarity(words, index)
-            score_list.append((self.param.docs_list[index], score))
-        return score_list
+        return [(self.param.docs_list[i], self._cal_similarity(words, i)) for i in range(self.param.length)]
 
-    def cal_similarity_rank(self, query: str):
-        """
-        相似度计算，排序
-        :param query: 待查询结果
-        :return: [(doc, score), ..]
-        """
+    def cal_similarity_rank(self, query: str) -> List[Tuple[str, float]]:
         result = self.cal_similarity(query)
-        result.sort(key=lambda x: -x[1])
-        return result
+        return sorted(result, key=lambda x: -x[1])
 
 
 
